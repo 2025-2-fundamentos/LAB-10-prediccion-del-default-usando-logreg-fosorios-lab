@@ -95,3 +95,163 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+ 
+# flake8: noqa: E501
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.model_selection import GridSearchCV
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    balanced_accuracy_score, precision_score, recall_score,
+    f1_score, confusion_matrix
+)
+import gzip
+import pickle
+import pandas as pd
+import json
+import os
+
+
+def procesar_datos(df):
+    data = df.copy()
+    data.drop(columns='ID', inplace=True)
+    data.rename(columns={'default payment next month': 'default'}, inplace=True)
+    data.dropna(inplace=True)
+    data = data[(data['EDUCATION'] != 0) & (data['MARRIAGE'] != 0)]
+    data.loc[data['EDUCATION'] > 4, 'EDUCATION'] = 4
+    return data
+
+
+def construir_pipeline():
+    cat_cols = ['SEX', 'EDUCATION', 'MARRIAGE']
+    num_cols = [
+        "LIMIT_BAL", "AGE", "PAY_0", "PAY_2", "PAY_3", "PAY_4", "PAY_5", "PAY_6",
+        "BILL_AMT1", "BILL_AMT2", "BILL_AMT3", "BILL_AMT4", "BILL_AMT5", "BILL_AMT6",
+        "PAY_AMT1", "PAY_AMT2", "PAY_AMT3", "PAY_AMT4", "PAY_AMT5", "PAY_AMT6"
+    ]
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('categorical', OneHotEncoder(handle_unknown='ignore'), cat_cols),
+            ('numerical', MinMaxScaler(), num_cols)
+        ],
+        remainder='passthrough'
+    )
+
+    selector = SelectKBest(score_func=f_classif)
+
+    pipeline = Pipeline(steps=[
+        ('preprocessing', preprocessor),
+        ('feature_selection', selector),
+        ('logreg', LogisticRegression(max_iter=1000, solver='saga', random_state=42))
+    ])
+    return pipeline
+
+
+def ajustar_modelo(pipeline, cv_folds, X_train, y_train, metric):
+    params = {
+        'feature_selection__k': range(1, 11),
+        'logreg__penalty': ['l1', 'l2'],
+        'logreg__C': [0.001, 0.01, 0.1, 1, 10, 100],
+    }
+
+    grid = GridSearchCV(
+        estimator=pipeline,
+        param_grid=params,
+        cv=cv_folds,
+        scoring=metric,
+        verbose=0
+    )
+    grid.fit(X_train, y_train)
+    return grid
+
+
+def obtener_metricas(modelo, X_train, y_train, X_test, y_test):
+    pred_train = modelo.predict(X_train)
+    pred_test = modelo.predict(X_test)
+
+    metrics_train = {
+        'type': 'metrics',
+        'dataset': 'train',
+        'precision': precision_score(y_train, pred_train),
+        'balanced_accuracy': balanced_accuracy_score(y_train, pred_train),
+        'recall': recall_score(y_train, pred_train),
+        'f1_score': f1_score(y_train, pred_train)
+    }
+
+    metrics_test = {
+        'type': 'metrics',
+        'dataset': 'test',
+        'precision': precision_score(y_test, pred_test),
+        'balanced_accuracy': balanced_accuracy_score(y_test, pred_test),
+        'recall': recall_score(y_test, pred_test),
+        'f1_score': f1_score(y_test, pred_test)
+    }
+
+    return metrics_train, metrics_test
+
+
+def generar_confusiones(modelo, X_train, y_train, X_test, y_test):
+    pred_train = modelo.predict(X_train)
+    pred_test = modelo.predict(X_test)
+
+    cm_train = confusion_matrix(y_train, pred_train)
+    cm_test = confusion_matrix(y_test, pred_test)
+
+    tn_tr, fp_tr, fn_tr, tp_tr = cm_train.ravel()
+    tn_te, fp_te, fn_te, tp_te = cm_test.ravel()
+
+    cm_dict_train = {
+        'type': 'cm_matrix',
+        'dataset': 'train',
+        'true_0': {'predicted_0': int(tn_tr), 'predicted_1': int(fp_tr)},
+        'true_1': {'predicted_0': int(fn_tr), 'predicted_1': int(tp_tr)}
+    }
+
+    cm_dict_test = {
+        'type': 'cm_matrix',
+        'dataset': 'test',
+        'true_0': {'predicted_0': int(tn_te), 'predicted_1': int(fp_te)},
+        'true_1': {'predicted_0': int(fn_te), 'predicted_1': int(tp_te)}
+    }
+
+    return cm_dict_train, cm_dict_test
+
+
+def guardar_modelo(modelo, path):
+    with gzip.open(path, 'wb') as f:
+        pickle.dump(modelo, f)
+
+
+if __name__ == "__main__":
+    # Lectura de datos
+    df_train = pd.read_csv("files/input/train_data.csv.zip")
+    df_test = pd.read_csv("files/input/test_data.csv.zip")
+
+    # Preprocesamiento
+    df_train = procesar_datos(df_train)
+    df_test = procesar_datos(df_test)
+
+    X_train, y_train = df_train.drop(columns=['default']), df_train['default']
+    X_test, y_test = df_test.drop(columns=['default']), df_test['default']
+
+    pipeline = construir_pipeline()
+    modelo_ajustado = ajustar_modelo(pipeline, 10, X_train, y_train, 'balanced_accuracy')
+
+    os.makedirs("files/models", exist_ok=True)
+    guardar_modelo(modelo_ajustado, "files/models/model.pkl.gz")
+
+    resultados = []
+
+    m_train, m_test = obtener_metricas(modelo_ajustado, X_train, y_train, X_test, y_test)
+    resultados.extend([m_train, m_test])
+
+    cm_train, cm_test = generar_confusiones(modelo_ajustado, X_train, y_train, X_test, y_test)
+    resultados.extend([cm_train, cm_test])
+
+    os.makedirs("files/output", exist_ok=True)
+    with open("files/output/metrics.json", 'w') as f_out:
+        for item in resultados:
+            f_out.write(json.dumps(item) + '\n')
